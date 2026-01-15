@@ -3,6 +3,9 @@ package services
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
+	"strings"
 
 	"github.com/drama-generator/backend/domain/models"
 	"github.com/drama-generator/backend/pkg/ai"
@@ -356,6 +359,16 @@ func (s *AIService) GetConfigForModel(serviceType string, modelName string) (*mo
 }
 
 func (s *AIService) GetAIClient(serviceType string) (ai.AIClient, error) {
+	if serviceType == "text" {
+		client, forced, err := s.getForcedTextClient()
+		if forced {
+			if err != nil {
+				return nil, err
+			}
+			return client, nil
+		}
+	}
+
 	config, err := s.GetDefaultConfig(serviceType)
 	if err != nil {
 		return nil, err
@@ -395,4 +408,46 @@ func (s *AIService) GenerateText(prompt string, systemPrompt string, options ...
 	}
 
 	return client.GenerateText(prompt, systemPrompt, options...)
+}
+
+func (s *AIService) getForcedTextClient() (ai.AIClient, bool, error) {
+	baseURL := strings.TrimSpace(os.Getenv("TEXT_AI_BASE_URL"))
+	apiKey := strings.TrimSpace(os.Getenv("TEXT_AI_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("TEXT_AI_MODEL"))
+	endpoint := strings.TrimSpace(os.Getenv("TEXT_AI_ENDPOINT"))
+
+	if baseURL == "" && apiKey == "" && model == "" && endpoint == "" {
+		return nil, false, nil
+	}
+
+	if baseURL == "" || apiKey == "" || model == "" {
+		return nil, true, fmt.Errorf("TEXT_AI_BASE_URL, TEXT_AI_API_KEY, and TEXT_AI_MODEL are required when forcing text AI config")
+	}
+
+	parsedURL, err := url.Parse(baseURL)
+	if err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" && endpoint == "" {
+		if strings.Contains(parsedURL.Path, "completions") {
+			endpoint = parsedURL.Path
+			baseURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+		}
+	}
+
+	if endpoint == "" {
+		endpoint = "/chat/completions"
+	}
+
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+
+	if strings.HasSuffix(baseURL, "/") {
+		baseURL = strings.TrimRight(baseURL, "/")
+	}
+
+	s.log.Infow("Using forced text AI config from env",
+		"base_url", baseURL,
+		"model", model,
+		"endpoint", endpoint)
+
+	return ai.NewOpenAIClient(baseURL, apiKey, model, endpoint), true, nil
 }

@@ -182,7 +182,7 @@ func (s *ScriptGenerationService) GenerateCharacters(req *GenerateCharactersRequ
 
 	count := req.Count
 	if count == 0 {
-		count = 5
+		count = 1
 	}
 
 	systemPrompt := `你是一个专业的角色分析师，擅长从剧本中提取和分析角色信息。

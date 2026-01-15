@@ -70,6 +70,7 @@ type ChatfireTaskResponse struct {
 		ID       string `json:"id,omitempty"`
 		Status   string `json:"status,omitempty"`
 		VideoURL string `json:"video_url,omitempty"`
+		Output   string `json:"output,omitempty"`
 	} `json:"data,omitempty"`
 	Content struct {
 		VideoURL string `json:"video_url,omitempty"`
@@ -141,7 +142,18 @@ func (c *ChatfireClient) GenerateVideo(imageURL, prompt string, opts ...VideoOpt
 	var jsonData []byte
 	var err error
 
-	if strings.Contains(model, "doubao") || strings.Contains(model, "seedance") {
+	lowerModel := strings.ToLower(model)
+	if strings.Contains(lowerModel, "veo") {
+		// Veo 格式（需要 prompt 字段）
+		reqBody := ChatfireRequest{
+			Model:    model,
+			Prompt:   prompt,
+			ImageURL: imageURL,
+			Duration: options.Duration,
+			Size:     options.AspectRatio,
+		}
+		jsonData, err = json.Marshal(reqBody)
+	} else if strings.Contains(lowerModel, "doubao") || strings.Contains(lowerModel, "seedance") {
 		// 豆包/火山格式
 		reqBody := ChatfireDoubaoRequest{
 			Model: model,
@@ -273,6 +285,8 @@ func (c *ChatfireClient) GenerateVideo(imageURL, prompt string, opts ...VideoOpt
 	}
 
 	endpoint := c.BaseURL + c.Endpoint
+	fmt.Printf("[Chatfire] Request URL: %s\n", endpoint)
+	fmt.Printf("[Chatfire] Request Body: %s\n", string(jsonData))
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -326,11 +340,20 @@ func (c *ChatfireClient) GenerateVideo(imageURL, prompt string, opts ...VideoOpt
 		return nil, fmt.Errorf("chatfire error: %s", errMsg)
 	}
 
+	videoURL := result.Data.VideoURL
+
 	videoResult := &VideoResult{
 		TaskID:    taskID,
 		Status:    status,
 		Completed: status == "completed" || status == "succeeded",
 		Duration:  options.Duration,
+	}
+	if videoURL != "" {
+		videoResult.VideoURL = videoURL
+		videoResult.Completed = true
+		if videoResult.Status == "" {
+			videoResult.Status = "completed"
+		}
 	}
 
 	return videoResult, nil
@@ -389,10 +412,13 @@ func (c *ChatfireClient) GetTaskStatus(taskID string) (*VideoResult, error) {
 		status = result.Data.Status
 	}
 
-	// 按优先级获取 video_url：VideoURL -> Data.VideoURL -> Content.VideoURL
+	// 按优先级获取 video_url：VideoURL -> Data.VideoURL -> Data.Output -> Content.VideoURL
 	videoURL := result.VideoURL
 	if videoURL == "" && result.Data.VideoURL != "" {
 		videoURL = result.Data.VideoURL
+	}
+	if videoURL == "" && result.Data.Output != "" {
+		videoURL = result.Data.Output
 	}
 	if videoURL == "" && result.Content.VideoURL != "" {
 		videoURL = result.Content.VideoURL
@@ -400,10 +426,11 @@ func (c *ChatfireClient) GetTaskStatus(taskID string) (*VideoResult, error) {
 
 	fmt.Printf("[Chatfire] Parsed result - TaskID: %s, Status: %s, VideoURL: %s\n", responseTaskID, status, videoURL)
 
+	completed := status == "completed" || status == "succeeded" || strings.EqualFold(status, "SUCCESS")
 	videoResult := &VideoResult{
 		TaskID:    responseTaskID,
 		Status:    status,
-		Completed: status == "completed" || status == "succeeded",
+		Completed: completed,
 	}
 
 	if errMsg := getErrorMessage(result.Error); errMsg != "" {

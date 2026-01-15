@@ -3,7 +3,10 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	models "github.com/drama-generator/backend/domain/models"
@@ -187,7 +190,7 @@ func (s *VideoGenerationService) ProcessVideoGeneration(videoGenID uint) {
 	s.log.Infow("Starting video generation", "id", videoGenID, "prompt", videoGen.Prompt, "provider", videoGen.Provider)
 
 	var opts []video.VideoOption
-	if videoGen.Model != "" {
+	if videoGen.Model != "" && !s.isForcedVideoConfig() {
 		opts = append(opts, video.WithModel(videoGen.Model))
 	}
 	if videoGen.Duration != nil {
@@ -391,6 +394,13 @@ func (s *VideoGenerationService) updateVideoGenError(videoGenID uint, errorMsg s
 }
 
 func (s *VideoGenerationService) getVideoClient(provider string, modelName string) (video.VideoClient, error) {
+	if client, forced, err := s.getForcedVideoClient(modelName); forced {
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
+
 	// 根据模型名称获取AI配置
 	var config *models.AIServiceConfig
 	var err error
@@ -444,6 +454,68 @@ func (s *VideoGenerationService) getVideoClient(provider string, modelName strin
 	default:
 		return nil, fmt.Errorf("unsupported video provider: %s", provider)
 	}
+}
+
+func (s *VideoGenerationService) getForcedVideoClient(modelName string) (video.VideoClient, bool, error) {
+	baseURL := strings.TrimSpace(os.Getenv("VIDEO_AI_BASE_URL"))
+	apiKey := strings.TrimSpace(os.Getenv("VIDEO_AI_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("VIDEO_AI_MODEL"))
+	endpoint := strings.TrimSpace(os.Getenv("VIDEO_AI_ENDPOINT"))
+	queryEndpoint := strings.TrimSpace(os.Getenv("VIDEO_AI_QUERY_ENDPOINT"))
+
+	if baseURL == "" && apiKey == "" && model == "" && endpoint == "" {
+		return nil, false, nil
+	}
+
+	if baseURL == "" || apiKey == "" {
+		return nil, true, fmt.Errorf("VIDEO_AI_BASE_URL and VIDEO_AI_API_KEY are required when forcing video AI config")
+	}
+
+	if model == "" {
+		model = modelName
+	}
+	if model == "" {
+		return nil, true, fmt.Errorf("VIDEO_AI_MODEL is required when forcing video AI config")
+	}
+
+	parsedURL, err := url.Parse(baseURL)
+	if err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" && endpoint == "" {
+		if parsedURL.Path != "" && parsedURL.Path != "/" {
+			endpoint = parsedURL.Path
+			baseURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+		}
+	}
+
+	if endpoint == "" {
+		endpoint = "/chat/completions"
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+	if queryEndpoint != "" && !strings.HasPrefix(queryEndpoint, "/") {
+		queryEndpoint = "/" + queryEndpoint
+	}
+	if strings.HasSuffix(baseURL, "/") {
+		baseURL = strings.TrimRight(baseURL, "/")
+	}
+
+	s.log.Infow("Using forced video AI config from env",
+		"base_url", baseURL,
+		"model", model,
+		"endpoint", endpoint)
+
+	if strings.Contains(endpoint, "chat/completions") {
+		return video.NewOpenAIChatVideoClient(baseURL, apiKey, model, endpoint), true, nil
+	}
+
+	return video.NewChatfireClient(baseURL, apiKey, model, endpoint, queryEndpoint), true, nil
+}
+
+func (s *VideoGenerationService) isForcedVideoConfig() bool {
+	return strings.TrimSpace(os.Getenv("VIDEO_AI_BASE_URL")) != "" ||
+		strings.TrimSpace(os.Getenv("VIDEO_AI_API_KEY")) != "" ||
+		strings.TrimSpace(os.Getenv("VIDEO_AI_MODEL")) != "" ||
+		strings.TrimSpace(os.Getenv("VIDEO_AI_ENDPOINT")) != ""
 }
 
 func (s *VideoGenerationService) RecoverPendingTasks() {

@@ -1,8 +1,12 @@
 package services
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -263,12 +267,31 @@ func (s *ImageGenerationService) pollTaskStatus(imageGenID uint, client image.Im
 
 func (s *ImageGenerationService) completeImageGeneration(imageGenID uint, result *image.ImageResult) {
 	now := time.Now()
+	imageURL := result.ImageURL
+
+	if s.localStorage != nil && strings.HasPrefix(imageURL, "data:image/") {
+		localURL, err := s.storeDataImage(imageURL, "images")
+		if err != nil {
+			errStr := err.Error()
+			if len(errStr) > 200 {
+				errStr = errStr[:200] + "..."
+			}
+			s.log.Warnw("Failed to store base64 image to local storage",
+				"error", errStr,
+				"id", imageGenID)
+		} else {
+			imageURL = localURL
+			s.log.Infow("Base64 image stored to local storage",
+				"id", imageGenID,
+				"local_url", truncateImageURL(localURL))
+		}
+	}
 
 	// 下载图片到本地存储（仅用于缓存，不更新数据库）
 	// 仅下载 HTTP/HTTPS URL，跳过 data URI
-	if s.localStorage != nil && result.ImageURL != "" &&
-		(strings.HasPrefix(result.ImageURL, "http://") || strings.HasPrefix(result.ImageURL, "https://")) {
-		_, err := s.localStorage.DownloadFromURL(result.ImageURL, "images")
+	if s.localStorage != nil && imageURL != "" &&
+		(strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://")) {
+		_, err := s.localStorage.DownloadFromURL(imageURL, "images")
 		if err != nil {
 			errStr := err.Error()
 			if len(errStr) > 200 {
@@ -277,18 +300,18 @@ func (s *ImageGenerationService) completeImageGeneration(imageGenID uint, result
 			s.log.Warnw("Failed to download image to local storage",
 				"error", errStr,
 				"id", imageGenID,
-				"original_url", truncateImageURL(result.ImageURL))
+				"original_url", truncateImageURL(imageURL))
 		} else {
 			s.log.Infow("Image downloaded to local storage for caching",
 				"id", imageGenID,
-				"original_url", truncateImageURL(result.ImageURL))
+				"original_url", truncateImageURL(imageURL))
 		}
 	}
 
 	// 数据库中保持使用原始URL
 	updates := map[string]interface{}{
 		"status":       models.ImageStatusCompleted,
-		"image_url":    result.ImageURL,
+		"image_url":    imageURL,
 		"completed_at": now,
 	}
 
@@ -311,12 +334,12 @@ func (s *ImageGenerationService) completeImageGeneration(imageGenID uint, result
 
 	// 如果关联了storyboard，同步更新storyboard的composed_image
 	if imageGen.StoryboardID != nil {
-		if err := s.db.Model(&models.Storyboard{}).Where("id = ?", *imageGen.StoryboardID).Update("composed_image", result.ImageURL).Error; err != nil {
+		if err := s.db.Model(&models.Storyboard{}).Where("id = ?", *imageGen.StoryboardID).Update("composed_image", imageURL).Error; err != nil {
 			s.log.Errorw("Failed to update storyboard composed_image", "error", err, "storyboard_id", *imageGen.StoryboardID)
 		} else {
 			s.log.Infow("Storyboard updated with composed image",
 				"storyboard_id", *imageGen.StoryboardID,
-				"composed_image", truncateImageURL(result.ImageURL))
+				"composed_image", truncateImageURL(imageURL))
 		}
 	}
 
@@ -324,27 +347,67 @@ func (s *ImageGenerationService) completeImageGeneration(imageGenID uint, result
 	if imageGen.SceneID != nil && imageGen.ImageType == string(models.ImageTypeScene) {
 		sceneUpdates := map[string]interface{}{
 			"status":    "generated",
-			"image_url": result.ImageURL,
+			"image_url": imageURL,
 		}
 		if err := s.db.Model(&models.Scene{}).Where("id = ?", *imageGen.SceneID).Updates(sceneUpdates).Error; err != nil {
 			s.log.Errorw("Failed to update scene", "error", err, "scene_id", *imageGen.SceneID)
 		} else {
 			s.log.Infow("Scene updated with generated image",
 				"scene_id", *imageGen.SceneID,
-				"image_url", truncateImageURL(result.ImageURL))
+				"image_url", truncateImageURL(imageURL))
 		}
 	}
 
 	// 如果关联了角色，同步更新角色的image_url
 	if imageGen.CharacterID != nil {
-		if err := s.db.Model(&models.Character{}).Where("id = ?", *imageGen.CharacterID).Update("image_url", result.ImageURL).Error; err != nil {
+		if err := s.db.Model(&models.Character{}).Where("id = ?", *imageGen.CharacterID).Update("image_url", imageURL).Error; err != nil {
 			s.log.Errorw("Failed to update character image_url", "error", err, "character_id", *imageGen.CharacterID)
 		} else {
 			s.log.Infow("Character updated with generated image",
 				"character_id", *imageGen.CharacterID,
-				"image_url", truncateImageURL(result.ImageURL))
+				"image_url", truncateImageURL(imageURL))
 		}
 	}
+}
+
+func (s *ImageGenerationService) storeDataImage(dataURI string, category string) (string, error) {
+	parts := strings.SplitN(dataURI, ",", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid data uri")
+	}
+
+	meta := parts[0]
+	rawData := strings.TrimSpace(parts[1])
+	rawData = strings.ReplaceAll(rawData, "\n", "")
+
+	if !strings.HasPrefix(meta, "data:") || !strings.Contains(meta, ";base64") {
+		return "", fmt.Errorf("unsupported data uri format")
+	}
+
+	mimeType := strings.TrimPrefix(meta, "data:")
+	if idx := strings.Index(mimeType, ";"); idx != -1 {
+		mimeType = mimeType[:idx]
+	}
+
+	payload, err := base64.StdEncoding.DecodeString(rawData)
+	if err != nil {
+		return "", fmt.Errorf("decode base64: %w", err)
+	}
+
+	ext := ".png"
+	switch strings.ToLower(mimeType) {
+	case "image/jpeg", "image/jpg":
+		ext = ".jpg"
+	case "image/png":
+		ext = ".png"
+	case "image/webp":
+		ext = ".webp"
+	case "image/gif":
+		ext = ".gif"
+	}
+
+	filename := "generated" + ext
+	return s.localStorage.Upload(bytes.NewReader(payload), filename, category)
 }
 
 func (s *ImageGenerationService) updateImageGenError(imageGenID uint, errorMsg string) {
@@ -413,6 +476,13 @@ func (s *ImageGenerationService) getImageClient(provider string) (image.ImageCli
 
 // getImageClientWithModel 根据模型名称获取图片客户端
 func (s *ImageGenerationService) getImageClientWithModel(provider string, modelName string) (image.ImageClient, error) {
+	if client, forced, err := s.getForcedImageClient(modelName); forced {
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
+
 	var config *models.AIServiceConfig
 	var err error
 
@@ -467,6 +537,57 @@ func (s *ImageGenerationService) getImageClientWithModel(provider string, modelN
 		endpoint = "/images/generations"
 		return image.NewOpenAIImageClient(config.BaseURL, config.APIKey, model, endpoint), nil
 	}
+}
+
+func (s *ImageGenerationService) getForcedImageClient(modelName string) (image.ImageClient, bool, error) {
+	baseURL := strings.TrimSpace(os.Getenv("IMAGE_AI_BASE_URL"))
+	apiKey := strings.TrimSpace(os.Getenv("IMAGE_AI_API_KEY"))
+	model := strings.TrimSpace(os.Getenv("IMAGE_AI_MODEL"))
+	endpoint := strings.TrimSpace(os.Getenv("IMAGE_AI_ENDPOINT"))
+
+	if baseURL == "" && apiKey == "" && model == "" && endpoint == "" {
+		return nil, false, nil
+	}
+
+	if baseURL == "" || apiKey == "" {
+		return nil, true, fmt.Errorf("IMAGE_AI_BASE_URL and IMAGE_AI_API_KEY are required when forcing image AI config")
+	}
+
+	if model == "" {
+		model = modelName
+	}
+	if model == "" {
+		return nil, true, fmt.Errorf("IMAGE_AI_MODEL is required when forcing image AI config")
+	}
+
+	parsedURL, err := url.Parse(baseURL)
+	if err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" && endpoint == "" {
+		if parsedURL.Path != "" && parsedURL.Path != "/" {
+			endpoint = parsedURL.Path
+			baseURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+		}
+	}
+
+	if endpoint == "" {
+		endpoint = "/chat/completions"
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+	if strings.HasSuffix(baseURL, "/") {
+		baseURL = strings.TrimRight(baseURL, "/")
+	}
+
+	s.log.Infow("Using forced image AI config from env",
+		"base_url", baseURL,
+		"model", model,
+		"endpoint", endpoint)
+
+	if strings.Contains(endpoint, "chat/completions") {
+		return image.NewOpenAIChatImageClient(baseURL, apiKey, model, endpoint), true, nil
+	}
+
+	return image.NewOpenAIImageClient(baseURL, apiKey, model, endpoint), true, nil
 }
 
 func (s *ImageGenerationService) GetImageGeneration(imageGenID uint) (*models.ImageGeneration, error) {
